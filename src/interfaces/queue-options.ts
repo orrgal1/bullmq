@@ -52,6 +52,16 @@ export interface QueueOptions extends QueueBaseOptions {
        */
       maxLen: number;
     };
+
+    /**
+     * Options for the pubsub stream.
+     */
+    pubsub?: {
+      /**
+       * Max approximated retention for stream messages. Default is 7 days.
+       */
+      maxRetentionMs?: number;
+    };
   };
 
   settings?: AdvancedRepeatOptions;

@@ -31,11 +31,11 @@ import sandbox from './sandbox';
 import { AsyncFifoQueue } from './async-fifo-queue';
 import {
   DelayedError,
-  RateLimitError,
   RATE_LIMIT_ERROR,
+  RateLimitError,
   WaitingChildrenError,
 } from './errors';
-import { JobScheduler } from './job-scheduler';
+import { Queue } from './queue';
 
 // 10 seconds is the maximum time a BRPOPLPUSH can block.
 const maximumBlockTimeout = 10;
@@ -155,6 +155,8 @@ export interface WorkerListener<
   stalled: (jobId: string, prev: string) => void;
 }
 
+type XReadGroupResult = [string, [string, string[]][]];
+
 /**
  *
  * This class represents a worker that is able to process jobs from the queue.
@@ -185,9 +187,7 @@ export class Worker<
   private resumeWorker: () => void;
   private stalledCheckTimer: NodeJS.Timeout;
   private waiting: Promise<number> | null = null;
-  private _repeat: Repeat; // To be deprecated in v6 in favor of Job Scheduler
-
-  private _jobScheduler: JobScheduler;
+  private _repeat: Repeat;
 
   protected paused: Promise<void>;
   protected processFn: Processor<DataType, ResultType, NameType>;
@@ -406,20 +406,6 @@ export class Worker<
     });
   }
 
-  get jobScheduler(): Promise<JobScheduler> {
-    return new Promise<JobScheduler>(async resolve => {
-      if (!this._jobScheduler) {
-        const connection = await this.client;
-        this._jobScheduler = new JobScheduler(this.name, {
-          ...this.opts,
-          connection,
-        });
-        this._jobScheduler.on('error', e => this.emit.bind(this, e));
-      }
-      resolve(this._jobScheduler);
-    });
-  }
-
   async run() {
     if (!this.processFn) {
       throw new Error('No process function is defined.');
@@ -435,7 +421,8 @@ export class Worker<
       if (this.closing) {
         return;
       }
-
+      this.startPubsubConsume();
+      this.startPubsubTrimStream();
       await this.startStalledCheckTimer();
 
       const jobsInProgress = new Set<{ job: Job; ts: number }>();
@@ -748,26 +735,11 @@ will never work with more accuracy than 1ms. */
       this.drained = false;
       const job = this.createJob(jobData, jobId);
       job.token = token;
-
-      // Add next scheduled job if necessary.
       if (job.opts.repeat) {
-        // Use new job scheduler if possible
-        if (job.repeatJobKey) {
-          const jobScheduler = await this.jobScheduler;
-          await jobScheduler.upsertJobScheduler(
-            job.repeatJobKey,
-            job.opts.repeat,
-            job.name,
-            job.data,
-            job.opts,
-            { override: false },
-          );
-        } else {
-          const repeat = await this.repeat;
-          await repeat.updateRepeatableJob(job.name, job.data, job.opts, {
-            override: false,
-          });
-        }
+        const repeat = await this.repeat;
+        await repeat.updateRepeatableJob(job.name, job.data, job.opts, {
+          override: false,
+        });
       }
       return job;
     }
@@ -1010,6 +982,101 @@ will never work with more accuracy than 1ms. */
           this.startLockExtenderTimer(jobsInProgress);
         }, this.opts.lockRenewTime / 2);
       }
+    }
+  }
+
+  /**
+   * If this worker supports pubsub start a consumer from the corresponding stream with the group provided.
+   * Transfer the jobs to a queue named after the stream+group.
+   */
+  startPubsubConsume(): void {
+    if (this.opts.pubsub) {
+      const { group } = this.opts.pubsub;
+      const queueName = `${this.name}:${group}`;
+      const opts = { ...this.opts, name: queueName };
+      delete opts.pubsub;
+      const queue = new Queue(queueName, opts);
+      queue
+        .waitUntilReady()
+        .then(async () => {
+          const streamName = `${this.opts.name}:stream`;
+          const consumerGroup = 'my-consumer-group';
+          const consumerName = v4();
+
+          const client = await this.client;
+          await client.xgroup(
+            'CREATE',
+            streamName,
+            consumerGroup,
+            '0',
+            'MKSTREAM',
+          );
+
+          while (!this.closing) {
+            const result = (await client.xreadgroup(
+              'GROUP',
+              consumerGroup,
+              consumerName,
+              'COUNT',
+              this.opts.pubsub.batchSize || 1,
+              'BLOCK',
+              this.opts.pubsub.blockTime || 1000,
+              'STREAMS',
+              streamName,
+              '>',
+            )) as XReadGroupResult[] | null;
+
+            if (result && result.length > 0) {
+              const [, messages] = result[0];
+              for (const [id, fields] of messages) {
+                const jobData: Record<string, string> = {};
+                for (let i = 0; i < fields.length; i += 2) {
+                  const key = fields[i];
+                  jobData[key] = fields[i + 1];
+                }
+                await queue.add(
+                  'default',
+                  JSON.parse(jobData['data']),
+                  JSON.parse(jobData['opts']),
+                );
+                await client.xack(streamName, consumerGroup, id);
+              }
+            }
+          }
+        })
+        .catch(error => this.emit('error', error));
+    }
+  }
+
+  /**
+   * If this worker supports pubsub start a loop that trims the stream according to defined retention.
+   */
+  startPubsubTrimStream(): void {
+    if (this.opts.pubsub) {
+      const streamName = `${this.opts.name}:stream`;
+      this.client.then(async client => {
+        while (!this.closing) {
+          const now = Date.now();
+          const cutoffTime = now - this.opts.pubsub.macRetentionMs;
+          const oldestMessages = await client.xrange(
+            streamName,
+            '-',
+            '+',
+            'COUNT',
+            1,
+          );
+
+          if (oldestMessages.length > 0) {
+            const oldestMessageId = oldestMessages[0][0];
+            const [oldestTimestamp] = oldestMessageId.split('-').map(Number);
+
+            if (oldestTimestamp < cutoffTime) {
+              await client.xtrim(streamName, 'MINID', `${cutoffTime}-0`);
+            }
+          }
+          await delay(1000);
+        }
+      });
     }
   }
 

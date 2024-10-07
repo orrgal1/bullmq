@@ -116,4 +116,8 @@ if parentDependenciesKey ~= nil then
     rcall("SADD", parentDependenciesKey, jobIdKey)
 end
 
+if opts['pubsub'] then
+    rcall("XADD", args[1] .. ":stream", "*", "event", "pubsub", "jobId", jobId, "opts", cjson.encode(opts), "data", data)
+end
+
 return jobId .. "" -- convert to string

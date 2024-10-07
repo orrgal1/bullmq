@@ -136,6 +136,31 @@ export interface WorkerOptions extends QueueBaseOptions, SandboxedOptions {
    * More advanced options.
    */
   settings?: AdvancedOptions;
+
+  /**
+   * If supplied worker will consume from the stream backing the queue with this consumer group name.
+   */
+  pubsub?: {
+    /**
+     * The consumer group for consuming from the stream.
+     */
+    group: string;
+
+    /**
+     * The batchSize to use when reading from the stream.
+     */
+    batchSize?: number;
+
+    /**
+     * The block time to use when reading from the stream.
+     */
+    blockTime?: number;
+
+    /**
+     * The number of milliseconds to retain events in the stream.
+     */
+    macRetentionMs?: number;
+  };
 }
 
 export interface GetNextJobOptions {

@@ -111,4 +111,9 @@ export interface BaseJobOptions extends DefaultJobOptions {
    * Internal property used by repeatable jobs.
    */
   prevMillis?: number;
+
+  /**
+   * flag to indicate if the job should be published to a stream.
+   */
+  pubsub?: boolean;
 }
